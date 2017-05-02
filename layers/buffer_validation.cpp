@@ -1293,9 +1293,219 @@ bool ValidateCopyImageTransferGranularityRequirements(layer_data *device_data, c
     VkExtent3D granularity = GetScaledItg(device_data, cb_node, img);
     skip |= CheckItgOffset(device_data, cb_node, &region->srcOffset, &granularity, i, function, "srcOffset");
     skip |= CheckItgOffset(device_data, cb_node, &region->dstOffset, &granularity, i, function, "dstOffset");
-    VkExtent3D subresource_extent = GetImageSubresourceExtent(img, &region->dstSubresource);
+    VkExtent3D subresource_extent = GetImageSubresourceExtent(img, &region->srcSubresource);
+    skip |= CheckItgExtent(device_data, cb_node, &region->extent, &region->srcOffset, &granularity, &subresource_extent, i,
+        function, "extent");
+    subresource_extent = GetImageSubresourceExtent(img, &region->dstSubresource);
     skip |= CheckItgExtent(device_data, cb_node, &region->extent, &region->dstOffset, &granularity, &subresource_extent, i,
-                           function, "extent");
+        function, "extent");
+    return skip;
+}
+
+// Validate contents of a VkImageCopy struct
+bool ValidateImageCopyData(const debug_report_data *report_data, const uint32_t regionCount, const VkImageCopy *ic_regions,
+                           const IMAGE_STATE *src_state, const IMAGE_STATE *dst_state) {
+    bool skip = false;
+
+    for (uint32_t i = 0; i < regionCount; i++) {
+        VkImageCopy image_copy = ic_regions[i];
+
+        // Do all checks on source image
+        //
+        if (src_state->createInfo.imageType == VK_IMAGE_TYPE_1D) {
+            if ((0 != image_copy.srcOffset.y) || (1 != image_copy.extent.height)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01742, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] srcOffset.y is %d and extent.height is %d. For 1D images these must "
+                                "be 0 and 1, respectively. %s",
+                                i, image_copy.srcOffset.y, image_copy.extent.height, validation_error_map[VALIDATION_ERROR_01742]);
+            }
+        }
+
+        if ((src_state->createInfo.imageType == VK_IMAGE_TYPE_1D) || (src_state->createInfo.imageType == VK_IMAGE_TYPE_2D)) {
+            if ((0 != image_copy.srcOffset.z) || (1 != image_copy.extent.depth)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01743, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] srcOffset.z is %d and extent.depth is %d. For 1D and 2D images "
+                                "these must be 0 and 1, respectively. %s",
+                                i, image_copy.srcOffset.z, image_copy.extent.depth, validation_error_map[VALIDATION_ERROR_01743]);
+            }
+        }
+
+        if (src_state->createInfo.imageType == VK_IMAGE_TYPE_3D) {
+            if ((0 != image_copy.srcSubresource.baseArrayLayer) || (1 != image_copy.srcSubresource.layerCount)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01199, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] srcSubresource.baseArrayLayer is %d and srcSubresource.layerCount "
+                                "is %d. For VK_IMAGE_TYPE_3D images these must be 0 and 1, respectively. %s",
+                                i, image_copy.srcSubresource.baseArrayLayer, image_copy.srcSubresource.layerCount,
+                                validation_error_map[VALIDATION_ERROR_01199]);
+            }
+        }
+
+        if ((image_copy.srcSubresource.baseArrayLayer >= src_state->createInfo.arrayLayers) ||
+            (image_copy.srcSubresource.baseArrayLayer + image_copy.srcSubresource.layerCount > src_state->createInfo.arrayLayers)) {
+            skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_02603, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] srcSubresource.baseArrayLayer (%d) must be less than the source image's "
+                            "arrayLayers (%d), and the sum of baseArrayLayer and srcSubresource.layerCount (%d) must be less than "
+                            "or equal to the source image's arrayLayers. %s",
+                            i, image_copy.srcSubresource.baseArrayLayer, src_state->createInfo.arrayLayers,
+                            image_copy.srcSubresource.layerCount, validation_error_map[VALIDATION_ERROR_02603]);
+        }
+
+        // Checks that apply only to compressed images
+        if (FormatIsCompressed(src_state->createInfo.format)) {
+            VkExtent3D block_size = FormatCompressedTexelBlockExtent(src_state->createInfo.format);
+
+            //  image offsets must be multiples of block dimensions
+            if ((SafeModulo(image_copy.srcOffset.x, block_size.width) != 0) ||
+                (SafeModulo(image_copy.srcOffset.y, block_size.height) != 0) ||
+                (SafeModulo(image_copy.srcOffset.z, block_size.depth) != 0)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01209, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] srcOffset (%d, %d) must be multiples of the compressed image's "
+                                "texel width & height (%d, %d). %s.",
+                                i, image_copy.srcOffset.x, image_copy.srcOffset.y, block_size.width, block_size.height,
+                                validation_error_map[VALIDATION_ERROR_01209]);
+            }
+
+            // extent width must be a multiple of block width, or extent+offset width must equal subresource width
+            VkExtent3D mip_extent = GetImageSubresourceExtent(src_state, &(image_copy.srcSubresource));
+            if ((SafeModulo(image_copy.extent.width, block_size.width) != 0) &&
+                (image_copy.extent.width + image_copy.srcOffset.x != mip_extent.width)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01210, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent width (%d) must be a multiple of the compressed texture block "
+                            "width (%d), or when added to srcOffset.x (%d) must equal the image subresource width (%d). %s.",
+                            i, image_copy.extent.width, block_size.width, image_copy.srcOffset.x, mip_extent.width,
+                            validation_error_map[VALIDATION_ERROR_01210]);
+            }
+
+            // extent height must be a multiple of block height, or extent+offset height must equal subresource height
+            if ((SafeModulo(image_copy.extent.height, block_size.height) != 0) &&
+                (image_copy.extent.height + image_copy.srcOffset.y != mip_extent.height)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01211, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent height (%d) must be a multiple of the compressed texture block "
+                            "height (%d), or when added to srcOffset.y (%d) must equal the image subresource height (%d). %s.",
+                            i, image_copy.extent.height, block_size.height, image_copy.srcOffset.y, mip_extent.height,
+                            validation_error_map[VALIDATION_ERROR_01211]);
+            }
+
+            // extent depth must be a multiple of block depth, or extent+offset depth must equal subresource depth
+            if ((SafeModulo(image_copy.extent.depth, block_size.depth) != 0) &&
+                (image_copy.extent.depth + image_copy.srcOffset.z != mip_extent.depth)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(src_state->image), __LINE__, VALIDATION_ERROR_01212, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent width (%d) must be a multiple of the compressed texture block "
+                            "depth (%d), or when added to srcOffset.z (%d) must equal the image subresource depth (%d). %s.",
+                            i, image_copy.extent.depth, block_size.depth, image_copy.srcOffset.z, mip_extent.depth,
+                            validation_error_map[VALIDATION_ERROR_01212]);
+            }
+        }  // Compressed
+
+        // Do all checks on dest image
+        //
+        if (dst_state->createInfo.imageType == VK_IMAGE_TYPE_1D) {
+            if ((0 != image_copy.dstOffset.y) || (1 != image_copy.extent.height)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01744, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] dstOffset.y is %d and extent.height is %d. For 1D images these must "
+                                "be 0 and 1, respectively. %s",
+                                i, image_copy.dstOffset.y, image_copy.extent.height, validation_error_map[VALIDATION_ERROR_01744]);
+            }
+        }
+
+        if ((dst_state->createInfo.imageType == VK_IMAGE_TYPE_1D) || (dst_state->createInfo.imageType == VK_IMAGE_TYPE_2D)) {
+            if ((0 != image_copy.dstOffset.z) || (1 != image_copy.extent.depth)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01745, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] dstOffset.z is %d and extent.depth is %d. For 1D and 2D images "
+                                "these must be 0 and 1, respectively. %s",
+                                i, image_copy.dstOffset.z, image_copy.extent.depth, validation_error_map[VALIDATION_ERROR_01745]);
+            }
+        }
+
+        if (dst_state->createInfo.imageType == VK_IMAGE_TYPE_3D) {
+            if ((0 != image_copy.dstSubresource.baseArrayLayer) || (1 != image_copy.dstSubresource.layerCount)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01199, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] dstSubresource.baseArrayLayer is %d and dstSubresource.layerCount "
+                                "is %d. For VK_IMAGE_TYPE_3D images these must be 0 and 1, respectively. %s",
+                                i, image_copy.dstSubresource.baseArrayLayer, image_copy.dstSubresource.layerCount,
+                                validation_error_map[VALIDATION_ERROR_01199]);
+            }
+        }
+
+        if ((image_copy.dstSubresource.baseArrayLayer >= dst_state->createInfo.arrayLayers) ||
+            (image_copy.dstSubresource.baseArrayLayer + image_copy.dstSubresource.layerCount > dst_state->createInfo.arrayLayers)) {
+            skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_02604, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] dstSubresource.baseArrayLayer (%d) must be less than the dest image's "
+                            "arrayLayers (%d), and the sum of baseArrayLayer and dstSubresource.layerCount (%d) must be less than "
+                            "or equal to the dest image's arrayLayers. %s",
+                            i, image_copy.dstSubresource.baseArrayLayer, dst_state->createInfo.arrayLayers,
+                            image_copy.dstSubresource.layerCount, validation_error_map[VALIDATION_ERROR_02604]);
+        }
+
+        // Checks that apply only to compressed images
+        if (FormatIsCompressed(dst_state->createInfo.format)) {
+            VkExtent3D block_size = FormatCompressedTexelBlockExtent(dst_state->createInfo.format);
+
+            //  image offsets must be multiples of block dimensions
+            if ((SafeModulo(image_copy.dstOffset.x, block_size.width) != 0) ||
+                (SafeModulo(image_copy.dstOffset.y, block_size.height) != 0) ||
+                (SafeModulo(image_copy.dstOffset.z, block_size.depth) != 0)) {
+                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                                reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01214, "IMAGE",
+                                "vkCmdCopyImage(): pRegion[%d] dstOffset (%d, %d) must be multiples of the compressed image's "
+                                "texel width & height (%d, %d). %s.",
+                                i, image_copy.dstOffset.x, image_copy.dstOffset.y, block_size.width, block_size.height,
+                                validation_error_map[VALIDATION_ERROR_01214]);
+            }
+
+            // extent width must be a multiple of block width, or extent+offset width must equal subresource width
+            VkExtent3D mip_extent = GetImageSubresourceExtent(dst_state, &(image_copy.dstSubresource));
+            if ((SafeModulo(image_copy.extent.width, block_size.width) != 0) &&
+                (image_copy.extent.width + image_copy.dstOffset.x != mip_extent.width)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01215, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent width (%d) must be a multiple of the compressed texture block "
+                            "width (%d), or when added to dstOffset.x (%d) must equal the image subresource width (%d). %s.",
+                            i, image_copy.extent.width, block_size.width, image_copy.dstOffset.x, mip_extent.width,
+                            validation_error_map[VALIDATION_ERROR_01215]);
+            }
+
+            // extent height must be a multiple of block height, or extent+offset height must equal subresource height
+            if ((SafeModulo(image_copy.extent.height, block_size.height) != 0) &&
+                (image_copy.extent.height + image_copy.dstOffset.y != mip_extent.height)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01216, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent height (%d) must be a multiple of the compressed texture block "
+                            "height (%d), or when added to dstOffset.y (%d) must equal the image subresource height (%d). %s.",
+                            i, image_copy.extent.height, block_size.height, image_copy.dstOffset.y, mip_extent.height,
+                            validation_error_map[VALIDATION_ERROR_01216]);
+            }
+
+            // extent depth must be a multiple of block depth, or extent+offset depth must equal subresource depth
+            if ((SafeModulo(image_copy.extent.depth, block_size.depth) != 0) &&
+                (image_copy.extent.depth + image_copy.dstOffset.z != mip_extent.depth)) {
+                skip |=
+                    log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+                            reinterpret_cast<const uint64_t &>(dst_state->image), __LINE__, VALIDATION_ERROR_01217, "IMAGE",
+                            "vkCmdCopyImage(): pRegion[%d] extent width (%d) must be a multiple of the compressed texture block "
+                            "depth (%d), or when added to dstOffset.z (%d) must equal the image subresource depth (%d). %s.",
+                            i, image_copy.extent.depth, block_size.depth, image_copy.dstOffset.z, mip_extent.depth,
+                            validation_error_map[VALIDATION_ERROR_01217]);
+            }
+        }  // Compressed
+    }
     return skip;
 }
 
@@ -1304,6 +1514,8 @@ bool PreCallValidateCmdCopyImage(layer_data *device_data, GLOBAL_CB_NODE *cb_nod
                                  VkImageLayout src_image_layout, VkImageLayout dst_image_layout) {
     bool skip = false;
     const debug_report_data *report_data = core_validation::GetReportData(device_data);
+    skip = ValidateImageCopyData(report_data, region_count, regions, src_image_state, dst_image_state);
+
     VkCommandBuffer command_buffer = cb_node->commandBuffer;
 
     for (uint32_t i = 0; i < region_count; i++) {
@@ -1380,22 +1592,6 @@ bool PreCallValidateCmdCopyImage(layer_data *device_data, GLOBAL_CB_NODE *cb_nod
             skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_COMMAND_BUFFER_EXT,
                             reinterpret_cast<uint64_t &>(command_buffer), __LINE__, VALIDATION_ERROR_01221, "IMAGE", "%s. %s", str,
                             validation_error_map[VALIDATION_ERROR_01221]);
-        }
-
-        if (!GetDeviceExtensions(device_data)->khr_maintenance1) {
-            // If either of the calling command's src_image or dst_image parameters are of VkImageType VK_IMAGE_TYPE_3D,
-            // the baseArrayLayer and layerCount members of both srcSubresource and dstSubresource must be 0 and 1, respectively
-            if (((src_image_state->createInfo.imageType == VK_IMAGE_TYPE_3D) ||
-                 (dst_image_state->createInfo.imageType == VK_IMAGE_TYPE_3D)) &&
-                ((regions[i].srcSubresource.baseArrayLayer != 0) || (regions[i].srcSubresource.layerCount != 1) ||
-                 (regions[i].dstSubresource.baseArrayLayer != 0) || (regions[i].dstSubresource.layerCount != 1))) {
-                std::stringstream ss;
-                ss << "vkCmdCopyImage: src or dstImage type was IMAGE_TYPE_3D, but in subRegion[" << i
-                   << "] baseArrayLayer was not zero or layerCount was not 1.";
-                skip |= log_msg(report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_COMMAND_BUFFER_EXT,
-                                reinterpret_cast<uint64_t &>(command_buffer), __LINE__, VALIDATION_ERROR_01199, "IMAGE", "%s. %s",
-                                ss.str().c_str(), validation_error_map[VALIDATION_ERROR_01199]);
-            }
         }
 
         // MipLevel must be less than the mipLevels specified in VkImageCreateInfo when the image was created
