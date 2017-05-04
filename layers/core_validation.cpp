@@ -8826,6 +8826,7 @@ static bool IsPowerOfTwo(unsigned x) { return x && !(x & (x - 1)); }
 
 static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRenderPassCreateInfo *pCreateInfo) {
     bool skip = false;
+    std::vector<int32_t> first_subpass_used(pCreateInfo->attachmentCount, -1);
     for (uint32_t i = 0; i < pCreateInfo->subpassCount; ++i) {
         const VkSubpassDescription &subpass = pCreateInfo->pSubpasses[i];
         if (subpass.pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -8834,6 +8835,48 @@ static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRend
                             "CreateRenderPass: Pipeline bind point for subpass %d must be VK_PIPELINE_BIND_POINT_GRAPHICS. %s", i,
                             validation_error_map[VALIDATION_ERROR_00347]);
         }
+
+        // Must check input attachments first, for VU #00349
+        for (uint32_t j = 0; j < subpass.inputAttachmentCount; ++j) {
+            uint32_t attachment = subpass.pInputAttachments[j].attachment;
+            skip |= ValidateAttachmentIndex(dev_data, attachment, pCreateInfo->attachmentCount, "Input");
+
+            VkImageLayout layout = subpass.pInputAttachments[j].layout;
+            bool found_layout_mismatch = subpass.pDepthStencilAttachment &&
+                                         subpass.pDepthStencilAttachment->attachment == attachment &&
+                                         subpass.pDepthStencilAttachment->layout != layout;
+            for (uint32_t c = 0; !found_layout_mismatch && c < subpass.colorAttachmentCount; ++c) {
+                found_layout_mismatch =
+                    (subpass.pColorAttachments[c].attachment == attachment && subpass.pColorAttachments[c].layout != layout);
+            }
+            if (found_layout_mismatch) {
+                skip |= log_msg(
+                    dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__,
+                    VALIDATION_ERROR_00358, "DS",
+                    "CreateRenderPass:  Subpass %u pInputAttachments[%u] (%u) has layout %u, but is also used as a depth/color "
+                    "attachment with a different layout. %s",
+                    i, j, attachment, layout, validation_error_map[VALIDATION_ERROR_00358]);
+            }
+
+            if (!skip && attachment != VK_ATTACHMENT_UNUSED && first_subpass_used[attachment] == -1) {
+                first_subpass_used[attachment] = i;
+                bool used_as_depth =
+                    (subpass.pDepthStencilAttachment != NULL && subpass.pDepthStencilAttachment->attachment == attachment);
+                bool used_as_color = false;
+                for (uint32_t k = 0; !used_as_color && k < subpass.colorAttachmentCount; ++k) {
+                    used_as_color = (subpass.pColorAttachments[k].attachment == attachment);
+                }
+                if (!used_as_depth && !used_as_color &&
+                    pCreateInfo->pAttachments[attachment].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    skip |= log_msg(
+                        dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__,
+                        VALIDATION_ERROR_00349, "DS",
+                        "CreateRenderPass: attachment %u is first used as an input attachment in subpass %u with loadOp=CLEAR. %s",
+                        attachment, i, validation_error_map[VALIDATION_ERROR_00349]);
+                }
+            }
+        }
+
         for (uint32_t j = 0; j < subpass.preserveAttachmentCount; ++j) {
             uint32_t attachment = subpass.pPreserveAttachments[j];
             if (attachment == VK_ATTACHMENT_UNUSED) {
@@ -8843,6 +8886,26 @@ static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRend
                                 validation_error_map[VALIDATION_ERROR_00356]);
             } else {
                 skip |= ValidateAttachmentIndex(dev_data, attachment, pCreateInfo->attachmentCount, "Preserve");
+
+                if (first_subpass_used[attachment] == -1) {
+                    first_subpass_used[attachment] = i;
+                }
+
+                bool found = (subpass.pDepthStencilAttachment != NULL && subpass.pDepthStencilAttachment->attachment == attachment);
+                for (uint32_t r = 0; !found && r < subpass.inputAttachmentCount; ++r) {
+                    found = (subpass.pInputAttachments[r].attachment == attachment);
+                }
+                for (uint32_t r = 0; !found && r < subpass.colorAttachmentCount; ++r) {
+                    found = (subpass.pColorAttachments[r].attachment == attachment) ||
+                            (subpass.pResolveAttachments != NULL && subpass.pResolveAttachments[r].attachment == attachment);
+                }
+                if (found) {
+                    skip |= log_msg(
+                        dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__,
+                        VALIDATION_ERROR_00357, "DS",
+                        "CreateRenderPass: subpass %u pPreserveAttachments[%u] (%u) must not be used elsewhere in the subpass. %s",
+                        i, j, attachment, validation_error_map[VALIDATION_ERROR_00357]);
+                }
             }
         }
 
@@ -8861,12 +8924,25 @@ static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRend
 
                 if (!skip && attachment != VK_ATTACHMENT_UNUSED &&
                     pCreateInfo->pAttachments[attachment].samples != VK_SAMPLE_COUNT_1_BIT) {
+                    if (first_subpass_used[attachment] == -1) {
+                        first_subpass_used[attachment] = i;
+                    }
+
                     skip |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT,
                                     0, __LINE__, VALIDATION_ERROR_00352, "DS",
                                     "CreateRenderPass:  Subpass %u requests multisample resolve into attachment %u, "
                                     "which must have VK_SAMPLE_COUNT_1_BIT but has %s. %s",
                                     i, attachment, string_VkSampleCountFlagBits(pCreateInfo->pAttachments[attachment].samples),
                                     validation_error_map[VALIDATION_ERROR_00352]);
+                }
+
+                if (!skip && subpass.pResolveAttachments[j].attachment != VK_ATTACHMENT_UNUSED &&
+                    subpass.pColorAttachments[j].attachment == VK_ATTACHMENT_UNUSED) {
+                    skip |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT,
+                                    0, __LINE__, VALIDATION_ERROR_00350, "DS",
+                                    "CreateRenderPass:  Subpass %u requests multisample resolve from attachment %u "
+                                    "which has attachment=VK_ATTACHMENT_UNUSED. %s",
+                                    i, attachment, validation_error_map[VALIDATION_ERROR_00350]);
                 }
             }
             attachment = subpass.pColorAttachments[j].attachment;
@@ -8875,12 +8951,29 @@ static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRend
             if (!skip && attachment != VK_ATTACHMENT_UNUSED) {
                 sample_count |= (unsigned)pCreateInfo->pAttachments[attachment].samples;
 
+                if (first_subpass_used[attachment] == -1) {
+                    first_subpass_used[attachment] = i;
+                }
+
                 if (subpass_performs_resolve && pCreateInfo->pAttachments[attachment].samples == VK_SAMPLE_COUNT_1_BIT) {
                     skip |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT,
                                     0, __LINE__, VALIDATION_ERROR_00351, "DS",
                                     "CreateRenderPass:  Subpass %u requests multisample resolve from attachment %u "
                                     "which has VK_SAMPLE_COUNT_1_BIT. %s",
                                     i, attachment, validation_error_map[VALIDATION_ERROR_00351]);
+                }
+
+                if (subpass_performs_resolve && subpass.pResolveAttachments[j].attachment != VK_ATTACHMENT_UNUSED) {
+                    const auto &color_desc = pCreateInfo->pAttachments[attachment];
+                    const auto &resolve_desc = pCreateInfo->pAttachments[subpass.pResolveAttachments[j].attachment];
+                    if (color_desc.format != resolve_desc.format) {
+                        skip |= log_msg(dev_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT,
+                                        VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__, VALIDATION_ERROR_00353, "DS",
+                                        "CreateRenderPass:  Subpass %u pColorAttachments[%u] resolves to an attachment with a "
+                                        "different format. "
+                                        "color format: %u, resolve format: %u. %s",
+                                        i, j, color_desc.format, resolve_desc.format, validation_error_map[VALIDATION_ERROR_00353]);
+                    }
                 }
             }
         }
@@ -8891,12 +8984,10 @@ static bool ValidateRenderpassAttachmentUsage(layer_data *dev_data, const VkRend
 
             if (!skip && attachment != VK_ATTACHMENT_UNUSED) {
                 sample_count |= (unsigned)pCreateInfo->pAttachments[attachment].samples;
+                if (first_subpass_used[attachment] == -1) {
+                    first_subpass_used[attachment] = i;
+                }
             }
-        }
-
-        for (uint32_t j = 0; j < subpass.inputAttachmentCount; ++j) {
-            uint32_t attachment = subpass.pInputAttachments[j].attachment;
-            skip |= ValidateAttachmentIndex(dev_data, attachment, pCreateInfo->attachmentCount, "Input");
         }
 
         if (sample_count && !IsPowerOfTwo(sample_count)) {
